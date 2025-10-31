@@ -4,6 +4,10 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/synch.h"
+
+// Forward declarations 
+struct file;
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -17,6 +21,7 @@ enum thread_status
 /* Thread identifier type.
    You can redefine this to whatever type you like. */
 typedef int tid_t;
+typedef tid_t pid_t;                    /* Process ID type */
 #define TID_ERROR ((tid_t) -1)          /* Error value for tid_t. */
 
 /* Thread priorities. */
@@ -93,9 +98,29 @@ struct thread
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
 
+
+    int64_t wakeup_time;                //Time to wake up 
+    struct list_elem sleep_elem;        // List element for sleeping threads
+
+    int base_priority;                  // Original priority before donation
+    struct list locks_held;             // List of locks this thread holds
+    struct lock *lock_waiting_on;       // Lock this thread is waiting for
+
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    
+    /* User program fields */
+    struct list file_descriptors;       // List of open file descriptors
+    int exit_status;                    // Exit status
+    struct semaphore wait_sema;         // Semaphore for parent waiting
+    struct list children;               // List of child processes
+    struct list_elem child_elem;        // Element in parent's children list
+    tid_t parent_tid;                   // Parent thread ID
+    bool parent_waiting;                // Is parent waiting for this child?
+    bool load_success;                  // Did the executable load successfully?
+    struct semaphore load_sema;         // Semaphore for load completion
+    struct file *executable_file;       // Executable file (to deny writes)
 #endif
 
     /* Owned by thread.c. */
@@ -137,5 +162,14 @@ int thread_get_nice (void);
 void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
+
+// Functions for priority scheduling 
+bool thread_priority_compare (const struct list_elem *a, 
+                              const struct list_elem *b, 
+                              void *aux UNUSED);
+void thread_yield_to_higher_priority (void);
+
+// Helper to find child thread
+struct thread *thread_get_child (tid_t child_tid);
 
 #endif /* threads/thread.h */

@@ -17,9 +17,12 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
+#include "threads/synch.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static bool setup_stack (void **esp, const char *file_name);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -29,6 +32,8 @@ tid_t
 process_execute (const char *file_name) 
 {
   char *fn_copy;
+  char *prog_name;
+  char *save_ptr;
   tid_t tid;
 
   /* Make a copy of FILE_NAME.
@@ -37,11 +42,38 @@ process_execute (const char *file_name)
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
+  
+  // Extract program name for thread name 
+  prog_name = malloc (strlen (file_name) + 1);
+  if (prog_name == NULL)
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+  strlcpy (prog_name, file_name, strlen (file_name) + 1);
+  prog_name = strtok_r (prog_name, " ", &save_ptr);
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (prog_name, PRI_DEFAULT, start_process, fn_copy);
+  free (prog_name);
+  
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+
+  // Wait for child to complete loading
+  struct thread *child = thread_get_child (tid);
+  if (child != NULL)
+    {
+      sema_down (&child->load_sema);
+      
+      // If load failed, return error 
+      if (!child->load_success)
+        return TID_ERROR;
+    }
+    
   return tid;
 }
 
@@ -53,6 +85,7 @@ start_process (void *file_name_)
   char *file_name = file_name_;
   struct intr_frame if_;
   bool success;
+  struct thread *cur = thread_current ();
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -60,6 +93,10 @@ start_process (void *file_name_)
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (file_name, &if_.eip, &if_.esp);
+
+  // Signal parent about load result
+  cur->load_success = success;
+  sema_up (&cur->load_sema);
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
@@ -86,9 +123,31 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) 
 {
-  return -1;
+  struct thread *child = thread_get_child (child_tid);
+  
+  // Child not found or not a direct child 
+  if (child == NULL)
+    return -1;
+
+  // Already waited for this child
+  if (child->parent_waiting)
+    return -1;
+
+  // Mark that we're waiting
+  child->parent_waiting = true;
+  
+  // Wait for child to exit 
+  sema_down (&child->wait_sema);
+
+  // Get exit status
+  int exit_status = child->exit_status;
+
+  // Don't free the child page here - it will be freed by thread_schedule_tail
+  // since parent_waiting is now true
+
+  return exit_status;
 }
 
 /* Free the current process's resources. */
@@ -131,7 +190,7 @@ process_activate (void)
      interrupts. */
   tss_update ();
 }
-
+
 /* We load ELF binaries.  The following definitions are taken
    from the ELF specification, [ELF1], more-or-less verbatim.  */
 
@@ -195,7 +254,7 @@ struct Elf32_Phdr
 #define PF_W 2          /* Writable. */
 #define PF_R 4          /* Readable. */
 
-static bool setup_stack (void **esp);
+static bool setup_stack (void **esp, const char *file_name);
 static bool validate_segment (const struct Elf32_Phdr *, struct file *);
 static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
                           uint32_t read_bytes, uint32_t zero_bytes,
@@ -214,20 +273,37 @@ load (const char *file_name, void (**eip) (void), void **esp)
   off_t file_ofs;
   bool success = false;
   int i;
+  char *prog_name, *save_ptr;
+
+  // Extract program name from command line
+  prog_name = malloc (strlen (file_name) + 1);
+  if (prog_name == NULL)
+    goto done;
+  strlcpy (prog_name, file_name, strlen (file_name) + 1);
+  prog_name = strtok_r (prog_name, " ", &save_ptr);
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
-  if (t->pagedir == NULL) 
-    goto done;
+  if (t->pagedir == NULL)
+    {
+      free (prog_name);
+      goto done;
+    }
   process_activate ();
 
   /* Open executable file. */
-  file = filesys_open (file_name);
+  file = filesys_open (prog_name);
+  free (prog_name);
+  
   if (file == NULL) 
     {
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
+    
+  // Deny writes to executable 
+  file_deny_write (file);
+  t->executable_file = file;
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -301,8 +377,8 @@ load (const char *file_name, void (**eip) (void), void **esp)
         }
     }
 
-  /* Set up stack. */
-  if (!setup_stack (esp))
+  // Set up stack. Pass full command line for argument parsing */
+  if (!setup_stack (esp, file_name))
     goto done;
 
   /* Start address. */
@@ -312,10 +388,10 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  // Don't close file - keep it open to deny writes
   return success;
 }
-
+
 /* load() helpers. */
 
 static bool install_page (void *upage, void *kpage, bool writable);
@@ -427,17 +503,87 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
 static bool
-setup_stack (void **esp) 
+setup_stack (void **esp, const char *file_name) 
 {
   uint8_t *kpage;
   bool success = false;
+  char *token, *save_ptr;
+  char *fn_copy;
+  int argc = 0;
+  char *argv[128];  // Maximum 128 arguments 
+  int i;
+  char **argv_addrs;
 
   kpage = palloc_get_page (PAL_USER | PAL_ZERO);
   if (kpage != NULL) 
     {
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
       if (success)
-        *esp = PHYS_BASE;
+        {
+          *esp = PHYS_BASE;
+
+          // Make a copy of file_name for tokenization
+          fn_copy = malloc (strlen (file_name) + 1);
+          if (fn_copy == NULL)
+            {
+              palloc_free_page (kpage);
+              return false;
+            }
+          strlcpy (fn_copy, file_name, strlen (file_name) + 1);
+
+          // Parse arguments
+          for (token = strtok_r (fn_copy, " ", &save_ptr); token != NULL;
+               token = strtok_r (NULL, " ", &save_ptr))
+            {
+              if (argc >= 128)
+                {
+                  free (fn_copy);
+                  return false;
+                }
+              argv[argc++] = token;
+            }
+
+          // Push argument strings onto stack (right to left)
+          for (i = argc - 1; i >= 0; i--)
+            {
+              int len = strlen (argv[i]) + 1;
+              *esp -= len;
+              memcpy (*esp, argv[i], len);
+              argv[i] = *esp;  // Save stack address
+            }
+
+          // Word-align to 4 bytes
+          while ((uint32_t)*esp % 4 != 0)
+            {
+              *esp -= 1;
+              *(uint8_t *)(*esp) = 0;
+            }
+
+          // Push NULL sentinel for argv[argc]
+          *esp -= 4;
+          *(uint32_t *)(*esp) = 0;
+
+          // Push argv pointers (right to left)
+          for (i = argc - 1; i >= 0; i--)
+            {
+              *esp -= 4;
+              *(char **)(*esp) = argv[i];
+            }
+
+          // Push argv (pointer to argv[0])
+          argv_addrs = *esp;
+          *esp -= 4;
+          *(char ***)(*esp) = argv_addrs;
+          
+         
+          *esp -= 4;
+          *(int *)(*esp) = argc;
+      
+          *esp -= 4;
+          *(void **)(*esp) = 0;
+          
+          free (fn_copy);
+        }
       else
         palloc_free_page (kpage);
     }

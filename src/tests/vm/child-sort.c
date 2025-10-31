@@ -7,7 +7,6 @@
 #include "tests/lib.h"
 #include "tests/main.h"
 
-const char *test_name = "child-sort";
 
 unsigned char buf[128 * 1024];
 size_t histogram[256];
@@ -15,6 +14,7 @@ size_t histogram[256];
 int
 main (int argc UNUSED, char *argv[]) 
 {
+  test_name = "child-sort";
   int handle;
   unsigned char *p;
   size_t size;

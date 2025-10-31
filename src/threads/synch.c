@@ -32,6 +32,10 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 
+// Helper function to update thread priority 
+static void thread_update_priority (struct thread *t);
+static void donate_priority (struct thread *t);
+
 /* Initializes semaphore SEMA to VALUE.  A semaphore is a
    nonnegative integer along with two atomic operators for
    manipulating it:
@@ -68,7 +72,8 @@ sema_down (struct semaphore *sema)
   old_level = intr_disable ();
   while (sema->value == 0) 
     {
-      list_push_back (&sema->waiters, &thread_current ()->elem);
+      list_insert_ordered (&sema->waiters, &thread_current ()->elem,
+                          thread_priority_compare, NULL);
       thread_block ();
     }
   sema->value--;
@@ -113,10 +118,19 @@ sema_up (struct semaphore *sema)
   ASSERT (sema != NULL);
 
   old_level = intr_disable ();
+  
   if (!list_empty (&sema->waiters)) 
+  {
+    /* Sort waiters by priority before unblocking */
+    list_sort (&sema->waiters, thread_priority_compare, NULL);
     thread_unblock (list_entry (list_pop_front (&sema->waiters),
                                 struct thread, elem));
+  }
   sema->value++;
+  
+  /* Yield if unblocked thread has higher priority */
+  thread_yield_to_higher_priority ();
+  
   intr_set_level (old_level);
 }
 
@@ -156,7 +170,7 @@ sema_test_helper (void *sema_)
       sema_up (&sema[1]);
     }
 }
-
+
 /* Initializes LOCK.  A lock can be held by at most a single
    thread at any given time.  Our locks are not "recursive", that
    is, it is an error for the thread currently holding a lock to
@@ -178,6 +192,7 @@ lock_init (struct lock *lock)
   ASSERT (lock != NULL);
 
   lock->holder = NULL;
+  lock->max_priority = PRI_MIN;
   sema_init (&lock->semaphore, 1);
 }
 
@@ -196,8 +211,29 @@ lock_acquire (struct lock *lock)
   ASSERT (!intr_context ());
   ASSERT (!lock_held_by_current_thread (lock));
 
+  struct thread *cur = thread_current ();
+  enum intr_level old_level = intr_disable ();
+
+  if (lock->holder != NULL)
+  {
+    cur->lock_waiting_on = lock;
+    
+    /* Update lock's max priority */
+    if (cur->priority > lock->max_priority)
+      lock->max_priority = cur->priority;
+    
+    /* Donate priority to holder */
+    donate_priority (lock->holder);
+  }
+
   sema_down (&lock->semaphore);
-  lock->holder = thread_current ();
+  
+  /* Acquired the lock */
+  lock->holder = cur;
+  cur->lock_waiting_on = NULL;
+  list_push_back (&cur->locks_held, &lock->elem);
+
+  intr_set_level (old_level);
 }
 
 /* Tries to acquires LOCK and returns true if successful or false
@@ -216,7 +252,10 @@ lock_try_acquire (struct lock *lock)
 
   success = sema_try_down (&lock->semaphore);
   if (success)
+  {
     lock->holder = thread_current ();
+    list_push_back (&thread_current ()->locks_held, &lock->elem);
+  }
   return success;
 }
 
@@ -231,8 +270,18 @@ lock_release (struct lock *lock)
   ASSERT (lock != NULL);
   ASSERT (lock_held_by_current_thread (lock));
 
+  enum intr_level old_level = intr_disable ();
+
   lock->holder = NULL;
+  lock->max_priority = PRI_MIN;
+  list_remove (&lock->elem);
+  
+  /* Update priority after releasing lock */
+  thread_update_priority (thread_current ());
+  
   sema_up (&lock->semaphore);
+
+  intr_set_level (old_level);
 }
 
 /* Returns true if the current thread holds LOCK, false
@@ -245,7 +294,55 @@ lock_held_by_current_thread (const struct lock *lock)
 
   return lock->holder == thread_current ();
 }
-
+
+/* Donate priority to thread T (recursive) */
+static void
+donate_priority (struct thread *t)
+{
+  if (t == NULL)
+    return;
+
+  struct thread *cur = thread_current ();
+  
+  /* Only donate if our priority is higher */
+  if (cur->priority > t->priority)
+  {
+    t->priority = cur->priority;
+    
+    /* Recursively donate through chain */
+    if (t->lock_waiting_on != NULL)
+    {
+      struct lock *lock = t->lock_waiting_on;
+      if (cur->priority > lock->max_priority)
+        lock->max_priority = cur->priority;
+      donate_priority (lock->holder);
+    }
+  }
+}
+
+/* Update thread priority based on locks held */
+static void
+thread_update_priority (struct thread *t)
+{
+  if (thread_mlfqs)
+    return;
+
+  t->priority = t->base_priority;
+  
+  if (!list_empty (&t->locks_held))
+  {
+    /* Find maximum priority among held locks */
+    struct list_elem *e;
+    for (e = list_begin (&t->locks_held); e != list_end (&t->locks_held);
+         e = list_next (e))
+    {
+      struct lock *lock = list_entry (e, struct lock, elem);
+      if (lock->max_priority > t->priority)
+        t->priority = lock->max_priority;
+    }
+  }
+}
+
 /* One semaphore in a list. */
 struct semaphore_elem 
   {
@@ -301,6 +398,22 @@ cond_wait (struct condition *cond, struct lock *lock)
   lock_acquire (lock);
 }
 
+/* Comparator for condition variable waiters */
+static bool
+cond_priority_compare (const struct list_elem *a, const struct list_elem *b,
+                      void *aux UNUSED)
+{
+  struct semaphore_elem *sa = list_entry (a, struct semaphore_elem, elem);
+  struct semaphore_elem *sb = list_entry (b, struct semaphore_elem, elem);
+  
+  struct thread *ta = list_entry (list_front (&sa->semaphore.waiters),
+                                 struct thread, elem);
+  struct thread *tb = list_entry (list_front (&sb->semaphore.waiters),
+                                 struct thread, elem);
+  
+  return ta->priority > tb->priority;
+}
+
 /* If any threads are waiting on COND (protected by LOCK), then
    this function signals one of them to wake up from its wait.
    LOCK must be held before calling this function.
@@ -316,9 +429,13 @@ cond_signal (struct condition *cond, struct lock *lock UNUSED)
   ASSERT (!intr_context ());
   ASSERT (lock_held_by_current_thread (lock));
 
-  if (!list_empty (&cond->waiters)) 
+  if (!list_empty (&cond->waiters))
+  {
+    /* Sort waiters by priority */
+    list_sort (&cond->waiters, cond_priority_compare, NULL);
     sema_up (&list_entry (list_pop_front (&cond->waiters),
                           struct semaphore_elem, elem)->semaphore);
+  }
 }
 
 /* Wakes up all threads, if any, waiting on COND (protected by
